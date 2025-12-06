@@ -1,5 +1,5 @@
-// Compile: gcc -o file_server file_server.c -pthread
-// Run: ./file_server
+// Compile: gcc -o file_server file_server.c -pthread -lssl -lcrypto
+// Run: ./file_server <dir> <password>
 
 
 #define _GNU_SOURCE
@@ -21,6 +21,8 @@
 #include <time.h>
 #include <limits.h>
 #include <stdint.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #define SERVER_PORT 5000
 #define BACKLOG 10
@@ -31,14 +33,19 @@
 #define CMD_BUF 4096
 
 const char *watch_dir = NULL; 
+const char *server_password = NULL;
+SSL_CTX *ctx = NULL;
 
 typedef struct {
     int sock;
+    SSL *ssl;
     struct sockaddr_in addr;
     char ip[INET_ADDRSTRLEN];
     pthread_t thread;
     pthread_mutex_t send_lock;
     int active;
+    int authenticated;
+    char username[64];
 } client_t;
 
 static client_t *clients[MAX_CLIENTS];
@@ -54,11 +61,11 @@ typedef struct {
     time_t timestamp;
 } metadata_t;
 
-ssize_t send_all(int sock, const void *buf, size_t len) {
+ssize_t send_all(client_t *c, const void *buf, size_t len) {
     const char *p = buf;
     size_t remaining = len;
     while (remaining > 0) {
-        ssize_t n = send(sock, p, remaining, 0);
+        int n = SSL_write(c->ssl, p, remaining);
         if (n <= 0) {
             if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
             return -1;
@@ -72,7 +79,7 @@ ssize_t send_all(int sock, const void *buf, size_t len) {
 /* Safe send for a client (locks per-client send_lock) */
 int client_send_locked(client_t *c, const void *buf, size_t len) {
     pthread_mutex_lock(&c->send_lock);
-    ssize_t res = send_all(c->sock, buf, len);
+    ssize_t res = send_all(c, buf, len);
     pthread_mutex_unlock(&c->send_lock);
     return (res == (ssize_t)len) ? 0 : -1;
 }
@@ -163,7 +170,7 @@ char *build_file_list(void) {
         snprintf(full, sizeof(full), "%s/%s", watch_dir, entry->d_name);
 
         struct stat st;
-        if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && strchr(entry->d_name, '|') == NULL) {
             size_t name_len = strlen(entry->d_name);
             // ensure capacity
             if (len + name_len + 2 >= cap) {
@@ -305,17 +312,21 @@ void remove_client(client_t *c) {
         }
     }
     pthread_mutex_unlock(&clients_lock);
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+    }
     close(c->sock);
     pthread_mutex_destroy(&c->send_lock);
     free(c);
 }
 
 /* Read a line terminated by '\n' from socket into buf (null-terminated), return length or -1 on error/closed */
-ssize_t recv_line(int sock, char *buf, size_t maxlen) {
+ssize_t recv_line(client_t *c, char *buf, size_t maxlen) {
     size_t idx = 0;
     while (idx + 1 < maxlen) {
         char ch;
-        ssize_t n = recv(sock, &ch, 1, 0);
+        int n = SSL_read(c->ssl, &ch, 1);
         if (n == 1) {
             buf[idx++] = ch;
             if (ch == '\n') break;
@@ -336,12 +347,12 @@ ssize_t recv_line(int sock, char *buf, size_t maxlen) {
 }
 
 /* Receive exactly `count` bytes from socket and write to `fd_out`. Returns 0 on success, -1 on error */
-int recv_to_fd(int sock, int fd_out, long long count) {
+int recv_to_fd(client_t *c, int fd_out, long long count) {
     char buf[BUF_SIZE];
     long long remaining = count;
     while (remaining > 0) {
         ssize_t toread = (remaining > (long long)sizeof(buf)) ? (ssize_t)sizeof(buf) : (ssize_t)remaining;
-        ssize_t r = recv(sock, buf, toread, 0);
+        int r = SSL_read(c->ssl, buf, toread);
         if (r > 0) {
             ssize_t w = write(fd_out, buf, (size_t)r);
             if (w != r) {
@@ -370,6 +381,7 @@ int sanitize_filename(const char *fname) {
     if (!fname || fname[0] == '\0') return -1;
     if (strstr(fname, "/") != NULL) return -1;
     if (strstr(fname, "..") != NULL) return -1;
+    if (strchr(fname, '|') != NULL) return -1;
     // you can add more checks here (allowed characters, length, etc.)
     return 0;
 }
@@ -415,6 +427,13 @@ int handle_upload(client_t *c, const char *header) {
 
     const char *size_str = colon + 1;
     char *next_colon = strchr(size_str, ':'); // look for username separator
+    
+    // Validate filename length just to be sure (already capped by PATH_MAX check/copy but let's be strict)
+    if (strlen(filename) > 255) { // Common fs limit
+        char err[] = "ERROR:Filename too long\n";
+        client_send_locked(c, err, strlen(err));
+        return -1;
+    }
     
     // If next_colon exists, size ends there. Else check null.
     // backward compatibility: if no username provided
@@ -475,7 +494,7 @@ int handle_upload(client_t *c, const char *header) {
 
     // Receive exactly filesize bytes from socket into outfd
     if (filesize > 0) {
-        if (recv_to_fd(c->sock, outfd, filesize) != 0) {
+        if (recv_to_fd(c, outfd, filesize) != 0) {
             close(outfd);
             unlink(tmppath);
             char err[] = "ERROR:Receive failed\n";
@@ -519,8 +538,42 @@ void *client_thread_fn(void *arg) {
     fprintf(stdout, "Client connected: %s\n", c->ip);
 
     char line[CMD_BUF];
+    if (SSL_accept(c->ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
+        goto cleanup;
+    }
+
+    // Auth handshake
+    // 1. Client must send AUTH:<password>
+    // 2. Server replies AUTH_OK or AUTH_FAIL
+    
+    // Read auth line
+    if (recv_line(c, line, sizeof(line)) > 0) {
+        // trim
+        size_t len = strlen(line);
+        while(len > 0 && (line[len-1] == '\r' || line[len-1] == '\n')) line[--len] = '\0';
+        
+        if (strncmp(line, "AUTH:", 5) == 0) {
+            char *pass = line + 5;
+            if (strcmp(pass, server_password) == 0) {
+                c->authenticated = 1;
+                client_send_locked(c, "AUTH_OK\n", 8);
+                fprintf(stdout, "Client authenticated: %s\n", c->ip);
+            } else {
+                client_send_locked(c, "AUTH_FAIL\n", 10);
+                fprintf(stdout, "Client sent wrong password: %s\n", c->ip);
+            }
+        }
+    }
+
+    if (!c->authenticated) {
+        // give brief moment to receive FAIL
+        usleep(100000);
+        goto cleanup;
+    }
+
     while (running && c->active) {
-        ssize_t n = recv_line(c->sock, line, sizeof(line));
+        ssize_t n = recv_line(c, line, sizeof(line));
         if (n > 0) {
             // line contains '\n' terminated string
             // trim whitespace/newline
@@ -578,6 +631,7 @@ void *client_thread_fn(void *arg) {
     }
 
     c->active = 0;
+cleanup:
     remove_client(c);
     return NULL;
 }
@@ -602,6 +656,11 @@ void *accept_loop(void *arg) {
         c->addr = cli_addr;
         inet_ntop(AF_INET, &cli_addr.sin_addr, c->ip, sizeof(c->ip));
         c->active = 1;
+        c->authenticated = 0;
+        
+        c->ssl = SSL_new(ctx);
+        SSL_set_fd(c->ssl, c->sock);
+        
         pthread_mutex_init(&c->send_lock, NULL);
 
         // add to clients array
@@ -634,29 +693,86 @@ void *accept_loop(void *arg) {
     return NULL;
 }
 
-/* Periodic broadcaster thread: sends list every LIST_INTERVAL_SEC unconditionally */
+/* Periodic broadcaster thread: sends list on inotify events */
 void *watcher_thread_fn(void *arg) {
     (void)arg;
+    
+    // Initial broadcast
+    char *list = build_file_list();
+    if (list) {
+        broadcast_file_list(list);
+        free(list);
+    }
+    
     while (running) {
-        char *list = build_file_list();
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(inotify_fd, &rfds);
+        
+        // Wait for event or timeout (heartbeat)
+        struct timeval tv;
+        tv.tv_sec = LIST_INTERVAL_SEC; 
+        tv.tv_usec = 0;
+        
+        int retval = select(inotify_fd + 1, &rfds, NULL, NULL, &tv);
+        if (retval == -1) {
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
+        } else if (retval > 0) {
+            // Event occurred
+            if (FD_ISSET(inotify_fd, &rfds)) {
+                // Drain the inotify buffer
+                char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+                ssize_t len;
+                while ((len = read(inotify_fd, buf, sizeof(buf))) > 0) {
+                    // Just drain; we don't strictly parse events because we rebuild the whole list anyway.
+                    // A real optimization would process specific events, but for < 1000 files, rebuild is fast.
+                }
+                if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    perror("read inotify");
+                }
+                
+                // Debounce: Wait a small bit to coalesce rapid events (e.g. copy or delete many files)
+                usleep(200000); 
+                
+                // Flush any further pending events during debounce
+                while (read(inotify_fd, buf, sizeof(buf)) > 0);
+            }
+        }
+        
+        // Update and broadcast
+        list = build_file_list();
         if (list) {
             broadcast_file_list(list);
             free(list);
         }
-
-        // Sleep for LIST_INTERVAL_SEC (interruptible)
-        struct timespec req = { LIST_INTERVAL_SEC, 0 }, rem;
-        while (nanosleep(&req, &rem) == -1) {
-            if (errno == EINTR) {
-                if (!running) break;
-                req = rem;
-                continue;
-            } else {
-                break;
-            }
-        }
     }
     return NULL;
+}
+
+/* Initialize openssl */
+void init_openssl() {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    const SSL_METHOD *method = TLS_server_method();
+    ctx = SSL_CTX_new(method);
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Set the key and cert */
+    if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0 ) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
 }
 
 /* Setup listening socket */
@@ -694,11 +810,12 @@ void int_handler(int signo) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <path_to_folder>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <path_to_folder> <password>\n", argv[0]);
         return 1;
     }
     watch_dir = argv[1];
+    server_password = argv[2];
 
     // Verify watch_dir exists
     struct stat st;
@@ -713,6 +830,8 @@ int main(int argc, char **argv) {
     listen_fd = setup_server_socket();
     if (listen_fd < 0) return 1;
     fprintf(stdout, "Server listening on port %d\n", SERVER_PORT);
+
+    init_openssl();
 
     inotify_fd = inotify_init1(IN_NONBLOCK);
     if (inotify_fd < 0) {
@@ -760,6 +879,8 @@ int main(int argc, char **argv) {
 
     if (inotify_fd >= 0) close(inotify_fd);
     if (listen_fd >= 0) close(listen_fd);
+    if (ctx) SSL_CTX_free(ctx);
+    EVP_cleanup();
 
     fprintf(stdout, "Server shutting down.\n");
     return 0;
