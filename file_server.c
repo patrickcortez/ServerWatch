@@ -1,7 +1,6 @@
-// file_server.c
 // Compile: gcc -o file_server file_server.c -pthread
 // Run: ./file_server
-// Edit watch_dir variable below to point to the folder you want to serve.
+
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -27,11 +26,11 @@
 #define BACKLOG 10
 #define BUF_SIZE 8192
 #define SEND_CHUNK 65536
-#define LIST_INTERVAL_SEC 2   // <-- changed to 2 seconds as requested
+#define LIST_INTERVAL_SEC 2   
 #define MAX_CLIENTS 256
 #define CMD_BUF 4096
 
-const char *watch_dir = "/home/cortez/FileShare/Public"; // <-- set this to the folder you want to serve 
+const char *watch_dir = NULL; 
 
 typedef struct {
     int sock;
@@ -48,7 +47,6 @@ static volatile int running = 1;
 static int listen_fd = -1;
 static int inotify_fd = -1;
 
-/* Helper: send all bytes (handles partial sends) */
 ssize_t send_all(int sock, const void *buf, size_t len) {
     const char *p = buf;
     size_t remaining = len;
@@ -583,15 +581,16 @@ void int_handler(int signo) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1) {
-        watch_dir = argv[1];
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <path_to_folder>\n", argv[0]);
+        return 1;
     }
+    watch_dir = argv[1];
 
     // Verify watch_dir exists
     struct stat st;
     if (stat(watch_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
         fprintf(stderr, "Error: watch directory '%s' does not exist or is not a directory.\n", watch_dir);
-        fprintf(stderr, "Either create it or run: %s /path/to/watch\n", argv[0]);
         return 1;
     }
 
@@ -602,8 +601,6 @@ int main(int argc, char **argv) {
     if (listen_fd < 0) return 1;
     fprintf(stdout, "Server listening on port %d\n", SERVER_PORT);
 
-    // Setup inotify to watch the directory for changes (not required for periodic sending,
-    // but left in place if you want future enhancement). Not fatal if not available.
     inotify_fd = inotify_init1(IN_NONBLOCK);
     if (inotify_fd < 0) {
         perror("inotify_init1");
