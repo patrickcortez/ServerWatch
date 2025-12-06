@@ -1,25 +1,16 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -pthread -g
-TARGET = file_server
-SRCS = main.c net.c client.c file_ops.c metadata.c
-OBJS = $(SRCS:.c=.o)
-HEADERS = common.h net.h client.h file_ops.h metadata.h
+IN = file_server.c
+OUT = file_server
+DEPS = -pthread
 
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
-
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) -c $< -o $@
+all:
+	$(CC) $(IN) -o $(OUT) $(DEPS)
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OUT)
 
-run: $(TARGET)
-	./$(TARGET) $(filter-out $@,$(MAKECMDGOALS))
+run: all
+	./$(OUT) $(filter-out $@,$(MAKECMDGOALS))
 
 %:
 	@:
-
-.PHONY: all clean run
