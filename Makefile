@@ -1,20 +1,25 @@
 CC = gcc
+CFLAGS = -Wall -Wextra -pthread -g
+TARGET = file_server
+SRCS = main.c net.c client.c file_ops.c metadata.c
+OBJS = $(SRCS:.c=.o)
+HEADERS = common.h net.h client.h file_ops.h metadata.h
 
-OUT = file_server
+all: $(TARGET)
 
-SRC = file_server.c
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
 
-all: $(OUT)
-	$(CC) $(SRC) -o $(OUT) -pthread
-
-$(OUT): $(SRC)
-	$(CC) $(SRC) -o $(OUT) -pthread
+%.o: %.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OUT)	
+	rm -f $(OBJS) $(TARGET)
 
-# Default watch dir if not provided
-WATCH_DIR ?= public
+run: $(TARGET)
+	./$(TARGET) $(filter-out $@,$(MAKECMDGOALS))
 
-run: $(OUT)
-	./$(OUT) $(WATCH_DIR)
+%:
+	@:
+
+.PHONY: all clean run
