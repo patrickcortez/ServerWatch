@@ -47,6 +47,13 @@ static volatile int running = 1;
 static int listen_fd = -1;
 static int inotify_fd = -1;
 
+#define MAX_METADATA_ENTRIES 1024
+typedef struct {
+    char filename[256];
+    char username[64];
+    time_t timestamp;
+} metadata_t;
+
 ssize_t send_all(int sock, const void *buf, size_t len) {
     const char *p = buf;
     size_t remaining = len;
@@ -70,6 +77,64 @@ int client_send_locked(client_t *c, const void *buf, size_t len) {
     return (res == (ssize_t)len) ? 0 : -1;
 }
 
+/* Save metadata for a file (append to .file_metadata) */
+void save_metadata(const char *filename, const char *username) {
+    char meta_path[PATH_MAX];
+    snprintf(meta_path, sizeof(meta_path), "%s/.file_metadata", watch_dir);
+    FILE *f = fopen(meta_path, "a");
+    if (f) {
+        // Format: filename|username|timestamp
+        fprintf(f, "%s|%s|%ld\n", filename, username, (long)time(NULL));
+        fclose(f);
+    }
+}
+
+/* Load all metadata into an array. Returns count. Caller must free invalid entries? No, just static array for now. */
+int load_metadata(metadata_t *entries, int max_entries) {
+    char meta_path[PATH_MAX];
+    snprintf(meta_path, sizeof(meta_path), "%s/.file_metadata", watch_dir);
+    FILE *f = fopen(meta_path, "r");
+    if (!f) return 0;
+    
+    char line[512];
+    int count = 0;
+    while (fgets(line, sizeof(line), f) && count < max_entries) {
+        // Parse: filename|username|timestamp
+        char *p = line;
+        char *pipe1 = strchr(p, '|');
+        if (!pipe1) continue;
+        *pipe1 = '\0';
+        
+        char *pipe2 = strchr(pipe1 + 1, '|');
+        if (!pipe2) continue;
+        *pipe2 = '\0';
+        
+        // Copy to specialized struct
+        strncpy(entries[count].filename, p, sizeof(entries[count].filename)-1);
+        strncpy(entries[count].username, pipe1+1, sizeof(entries[count].username)-1);
+        entries[count].timestamp = atol(pipe2 + 1);
+        
+        count++;
+    }
+    fclose(f);
+    // Note: We might have duplicate entries for same filename. 
+    // We should compact them or just search backwards later.
+    return count;
+}
+
+/* Find metadata for filename. Returns 1 if found, 0 otherwise. */
+int find_metadata(const char *fname, const metadata_t *entries, int count, char *out_user, time_t *out_time) {
+    // Search backwards to find latest
+    for (int i = count - 1; i >= 0; --i) {
+        if (strcmp(entries[i].filename, fname) == 0) {
+            strcpy(out_user, entries[i].username);
+            *out_time = entries[i].timestamp;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Read the directory and build newline-separated file list in dynamically allocated string */
 char *build_file_list(void) {
     DIR *d = opendir(watch_dir);
@@ -84,9 +149,14 @@ char *build_file_list(void) {
     if (!out) { closedir(d); return NULL; }
     out[0] = '\0';
 
+    // Load metadata once
+    metadata_t *meta = calloc(MAX_METADATA_ENTRIES, sizeof(metadata_t));
+    int meta_count = load_metadata(meta, MAX_METADATA_ENTRIES);
+
     while ((entry = readdir(d)) != NULL) {
-        // skip . and ..
+
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        if (entry->d_name[0] == '.') continue; // hide hidden files (like .file_metadata)
 
         // Build full path and check it's a regular file
         char full[PATH_MAX];
@@ -99,10 +169,32 @@ char *build_file_list(void) {
             if (len + name_len + 2 >= cap) {
                 cap *= 2;
                 char *tmp = realloc(out, cap);
-                if (!tmp) { free(out); closedir(d); return NULL; }
+                if (!tmp) { free(meta); free(out); closedir(d); return NULL; }
                 out = tmp;
             }
             strcat(out, entry->d_name);
+            
+            // Append metadata: |username|timestamp
+            char user[64] = "Unknown";
+            time_t ts = st.st_mtime; // fallback to file mtime
+            char fetched_user[64];
+            time_t fetched_ts;
+            if (find_metadata(entry->d_name, meta, meta_count, fetched_user, &fetched_ts)) {
+                strcpy(user, fetched_user);
+                ts = fetched_ts;
+            }
+            
+            char meta_str[128];
+            snprintf(meta_str, sizeof(meta_str), "|%s|%ld", user, (long)ts);
+            // Ensure capacity again? simplistic check above might not cover this extension
+            // For safety let's re-check cap or just hope 8192 is big enough (it reallocs above based on name len only)
+            // safer to resize slightly liberally
+             if (len + strlen(meta_str) + 100 >= cap) { // check again
+                 cap *= 2;
+                 out = realloc(out, cap);
+             }
+             strcat(out, meta_str);
+
             strcat(out, "\n");
             len = strlen(out);
         }
@@ -286,7 +378,9 @@ int sanitize_filename(const char *fname) {
 int handle_upload(client_t *c, const char *header) {
     // Parse header
     // header assumed trimmed and without trailing newline
-    // Format: upload:<filename>:<size>
+    // Parse header
+    // header assumed trimmed and without trailing newline
+    // Format: upload:<filename>:<size>:<username>
     const char *p = header + 7; // skip "upload:"
     if (*p == '\0') {
         char err[] = "ERROR:No filename/size provided\n";
@@ -320,15 +414,31 @@ int handle_upload(client_t *c, const char *header) {
     }
 
     const char *size_str = colon + 1;
-    if (*size_str == '\0') {
+    char *next_colon = strchr(size_str, ':'); // look for username separator
+    
+    // If next_colon exists, size ends there. Else check null.
+    // backward compatibility: if no username provided
+    
+    char username[64] = "Unknown";
+    size_t size_len = next_colon ? (size_t)(next_colon - size_str) : strlen(size_str);
+    char size_buf[32];
+    if (size_len >= sizeof(size_buf)) return -1;
+    memcpy(size_buf, size_str, size_len);
+    size_buf[size_len] = '\0';
+    
+    if (next_colon) {
+        strncpy(username, next_colon + 1, sizeof(username)-1);
+    }
+    
+    if (size_buf[0] == '\0') {
         char err[] = "ERROR:Missing size\n";
         client_send_locked(c, err, strlen(err));
         return -1;
     }
 
     char *endptr = NULL;
-    long long filesize = strtoll(size_str, &endptr, 10);
-    if (endptr == size_str || filesize < 0) {
+    long long filesize = strtoll(size_buf, &endptr, 10);
+    if (endptr == size_buf || filesize < 0) {
         char err[] = "ERROR:Bad size\n";
         client_send_locked(c, err, strlen(err));
         return -1;
@@ -388,7 +498,10 @@ int handle_upload(client_t *c, const char *header) {
     // success
     char ok[] = "UPLOAD_OK\n";
     client_send_locked(c, ok, strlen(ok));
-    fprintf(stdout, "Upload saved: %s (%lld bytes)\n", finalpath, filesize);
+    
+    save_metadata(finalpath + strlen(watch_dir) + 1, username); // extract basename
+
+    fprintf(stdout, "Upload saved: %s (%lld bytes) user=%s\n", finalpath, filesize, username);
 
     // Broadcast file list immediately so clients get update quicker
     char *list = build_file_list();
