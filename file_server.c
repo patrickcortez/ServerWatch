@@ -1,4 +1,4 @@
-// Compile: gcc -o file_server file_server.c -pthread -lssl -lcrypto
+// Compile: gcc -o file_server file_share.c -pthread -lssl -lcrypto
 // Run: ./file_server <dir> <password>
 
 
@@ -242,6 +242,9 @@ void broadcast_file_list(const char *list_str) {
 int send_file_to_client(client_t *c, const char *filename) {
     if (!c || !filename) return -1;
 
+    // Lock the client for the entire duration of the transfer to prevent interleaving
+    pthread_mutex_lock(&c->send_lock);
+
     char fullpath[PATH_MAX];
     snprintf(fullpath, sizeof(fullpath), "%s/%s", watch_dir, filename);
 
@@ -250,13 +253,15 @@ int send_file_to_client(client_t *c, const char *filename) {
         // send error
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "ERROR:File not found\n");
-        client_send_locked(c, errbuf, strlen(errbuf));
+        send_all(c, errbuf, strlen(errbuf));
+        pthread_mutex_unlock(&c->send_lock);
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "ERROR:Not a regular file\n");
-        client_send_locked(c, errbuf, strlen(errbuf));
+        send_all(c, errbuf, strlen(errbuf));
+        pthread_mutex_unlock(&c->send_lock);
         return -1;
     }
 
@@ -264,7 +269,8 @@ int send_file_to_client(client_t *c, const char *filename) {
     // Send header: FILE:<filename>:<size>\n
     char header[1024];
     snprintf(header, sizeof(header), "FILE:%s:%lld\n", filename, (long long)filesize);
-    if (client_send_locked(c, header, strlen(header)) < 0) {
+    if (send_all(c, header, strlen(header)) < 0) {
+        pthread_mutex_unlock(&c->send_lock);
         return -1;
     }
 
@@ -273,30 +279,39 @@ int send_file_to_client(client_t *c, const char *filename) {
     if (fd < 0) {
         char errbuf[512];
         snprintf(errbuf, sizeof(errbuf), "ERROR:Open failed\n");
-        client_send_locked(c, errbuf, strlen(errbuf));
+        send_all(c, errbuf, strlen(errbuf));
+        pthread_mutex_unlock(&c->send_lock);
         return -1;
     }
 
     char *buf = malloc(SEND_CHUNK);
-    if (!buf) { close(fd); return -1; }
+    if (!buf) { 
+        close(fd); 
+        pthread_mutex_unlock(&c->send_lock);
+        return -1; 
+    }
 
     ssize_t r;
-    off_t sent = 0;
+    // off_t sent = 0;
     while ((r = read(fd, buf, SEND_CHUNK)) > 0) {
-        if (client_send_locked(c, buf, (size_t)r) < 0) {
+        if (send_all(c, buf, (size_t)r) < 0) {
             fprintf(stderr, "Send failed while sending file to %s\n", c->ip);
             free(buf);
             close(fd);
+            pthread_mutex_unlock(&c->send_lock);
             return -1;
         }
-        sent += r;
+        // sent += r;
     }
     free(buf);
     close(fd);
 
     // Optionally send a DONE marker
     char done[] = "\nDONE\n";
-    client_send_locked(c, done, strlen(done));
+    send_all(c, done, strlen(done));
+    
+    pthread_mutex_unlock(&c->send_lock);
+    
     fprintf(stdout, "Sent file '%s' (%lld bytes) to %s\n", filename, (long long)filesize, c->ip);
     return 0;
 }
